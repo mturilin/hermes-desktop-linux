@@ -1,4 +1,4 @@
-name: Build Hermes Desktop ARM64
+name: Build Hermes Desktop Linux
 
 on:
   schedule:
@@ -20,7 +20,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: build-hermes-desktop-arm64
+  group: build-hermes-desktop-linux
   cancel-in-progress: false
 
 jobs:
@@ -63,7 +63,35 @@ jobs:
   build:
     needs: check
     if: needs.check.outputs.should_build == 'true'
-    runs-on: ubuntu-24.04-arm
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            runner: ubuntu-24.04
+            elf_regex: 'x86-64'
+            variant: standard
+            variant_env: ''
+            prefix: hermes-desktop
+          - arch: x64
+            runner: ubuntu-24.04
+            elf_regex: 'x86-64'
+            variant: light
+            variant_env: light
+            prefix: hermes-light
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            elf_regex: 'aarch64|ARM aarch64'
+            variant: standard
+            variant_env: ''
+            prefix: hermes-desktop
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            elf_regex: 'aarch64|ARM aarch64'
+            variant: light
+            variant_env: light
+            prefix: hermes-light
+    runs-on: ${{ matrix.runner }}
     steps:
       - name: Checkout NousResearch/hermes-agent
         uses: actions/checkout@v4
@@ -94,14 +122,21 @@ jobs:
         working-directory: hermes-agent
         run: node scripts/build/electron-runtime.mjs --source .
 
-      - name: Build Hermes Light (unpacked linux-arm64)
+      - name: Build ${{ matrix.prefix }} (${{ matrix.arch }})
         working-directory: hermes-agent/apps/desktop
         env:
-          HERMES_DESKTOP_VARIANT: light
-        run: pnpm run pack
+          HERMES_DESKTOP_VARIANT: ${{ matrix.variant_env }}
+        run: |
+          pnpm run build
+          pnpm run builder --linux AppImage --publish never
 
-      - name: Stage and verify tarball
+      - name: Stage and verify artifacts
         working-directory: hermes-agent/apps/desktop
+        env:
+          ARCH: ${{ matrix.arch }}
+          ELF_REGEX: ${{ matrix.elf_regex }}
+          PREFIX: ${{ matrix.prefix }}
+          VARIANT: ${{ matrix.variant }}
         run: |
           set -euo pipefail
 
@@ -119,9 +154,6 @@ jobs:
             exit 1
           fi
 
-          echo "Using unpacked directory: $UNPACKED_DIR"
-          ls -la "$UNPACKED_DIR"
-
           EXEC_NAME=""
           for candidate in "Hermes Light" "Hermes" "hermes-light" "hermes"; do
             if [ -x "$UNPACKED_DIR/$candidate" ]; then
@@ -132,18 +164,19 @@ jobs:
 
           if [ -z "$EXEC_NAME" ]; then
             echo "Could not locate Hermes executable in $UNPACKED_DIR" >&2
+            ls -la "$UNPACKED_DIR" >&2
             exit 1
           fi
 
           echo "Found executable: $EXEC_NAME"
           file "$UNPACKED_DIR/$EXEC_NAME"
-          file "$UNPACKED_DIR/$EXEC_NAME" | grep -qiE 'aarch64|ARM aarch64'
+          file "$UNPACKED_DIR/$EXEC_NAME" | grep -qiE "$ELF_REGEX"
 
-          STAGE="${RUNNER_TEMP}/stage/hermes-desktop"
+          STAGE="${RUNNER_TEMP}/stage/${PREFIX}"
           rm -rf "$STAGE"
           mkdir -p "$STAGE/bin" "$STAGE/share/icons"
           cp -a "$UNPACKED_DIR" "$STAGE/app"
-          cp -a assets/icon.png "$STAGE/share/icons/hermes-desktop.png"
+          cp -a assets/icon.png "$STAGE/share/icons/${PREFIX}.png"
 
           cat > "$STAGE/bin/hermes-desktop" <<'EOF'
           #!/usr/bin/env bash
@@ -175,6 +208,10 @@ jobs:
           EOF
           chmod +x "$STAGE/bin/hermes-desktop"
 
+          if [ "$VARIANT" = "light" ]; then
+            ln -s hermes-desktop "$STAGE/bin/hermes-light"
+          fi
+
           # Verify node-pty loads cleanly under the bundled Electron runtime
           NODE_PTY_ROOT="$STAGE/app/resources/app.asar.unpacked/dist/node_modules/node-pty"
           if [ -f "$NODE_PTY_ROOT/package.json" ]; then
@@ -185,30 +222,66 @@ jobs:
 
           OUT_DIR="${RUNNER_TEMP}/dist"
           mkdir -p "$OUT_DIR"
-          tar -C "${RUNNER_TEMP}/stage" -czf "$OUT_DIR/hermes-desktop-linux-arm64.tar.gz" hermes-desktop
-          (cd "$OUT_DIR" && sha256sum hermes-desktop-linux-arm64.tar.gz > SHA256SUMS)
+          tar -C "${RUNNER_TEMP}/stage" -czf "$OUT_DIR/${PREFIX}-linux-${ARCH}.tar.gz" "$PREFIX"
+
+          APPIMAGE="$(find release -maxdepth 1 -name '*.AppImage' | head -n 1)"
+          if [ -z "$APPIMAGE" ] || [ ! -f "$APPIMAGE" ]; then
+            echo "Could not find AppImage in release/:" >&2
+            ls -la release/ >&2
+            exit 1
+          fi
+          cp -a "$APPIMAGE" "$OUT_DIR/${PREFIX}-linux-${ARCH}.AppImage"
+          chmod +x "$OUT_DIR/${PREFIX}-linux-${ARCH}.AppImage"
+
           ls -lh "$OUT_DIR"
 
-      - name: Publish GitHub Release
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.prefix }}-linux-${{ matrix.arch }}
+          path: ${{ runner.temp }}/dist/*
+          retention-days: 1
+
+  release:
+    needs: [check, build]
+    if: needs.check.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Generate checksums and publish GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ needs.check.outputs.tag }}
         run: |
           set -euo pipefail
-          OUT_DIR="${RUNNER_TEMP}/dist"
-          NOTES="Automated Linux ARM64 (aarch64) build of **Hermes Light** (remote-only client) from [NousResearch/hermes-agent@${TAG}](https://github.com/NousResearch/hermes-agent/releases/tag/${TAG})."
+          cd dist
+          sha256sum *.tar.gz *.AppImage > SHA256SUMS
+          ls -lh
+
+          NOTES=$(cat <<EOF
+          Automated Linux (\`x64\` & \`arm64\`) builds of **Hermes Desktop** (standard) and **Hermes Light** (remote-only) from [NousResearch/hermes-agent@${TAG}](https://github.com/NousResearch/hermes-agent/releases/tag/${TAG}).
+
+          - **Standard (\`hermes-desktop-linux-*\`)**: full client supporting both local \`hermes\` runtime and remote gateways
+          - **Light (\`hermes-light-linux-*\`)**: remote-only client (no local runtime required)
+          EOF
+          )
 
           if gh release view "$TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
-            gh release upload "$TAG" \
-              "$OUT_DIR/hermes-desktop-linux-arm64.tar.gz" \
-              "$OUT_DIR/SHA256SUMS" \
+            gh release upload "$TAG" *.tar.gz *.AppImage SHA256SUMS \
               --repo "${{ github.repository }}" \
               --clobber
-          else
-            gh release create "$TAG" \
-              "$OUT_DIR/hermes-desktop-linux-arm64.tar.gz" \
-              "$OUT_DIR/SHA256SUMS" \
+            gh release edit "$TAG" \
               --repo "${{ github.repository }}" \
-              --title "Hermes Desktop ARM64 ${TAG}" \
+              --title "Hermes Desktop Linux ${TAG}" \
+              --notes "$NOTES"
+          else
+            gh release create "$TAG" *.tar.gz *.AppImage SHA256SUMS \
+              --repo "${{ github.repository }}" \
+              --title "Hermes Desktop Linux ${TAG}" \
               --notes "$NOTES"
           fi
