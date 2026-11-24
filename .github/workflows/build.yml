@@ -126,9 +126,11 @@ jobs:
         working-directory: hermes-agent/apps/desktop
         env:
           HERMES_DESKTOP_VARIANT: ${{ matrix.variant_env }}
+          TAG: ${{ needs.check.outputs.tag }}
         run: |
+          VERSION="${TAG#v}"
           pnpm run build
-          pnpm run builder --linux AppImage --publish never
+          pnpm run builder -- --linux AppImage --publish never -c.extraMetadata.version="${VERSION}"
 
       - name: Stage and verify artifacts
         working-directory: hermes-agent/apps/desktop
