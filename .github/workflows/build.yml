@@ -17,7 +17,7 @@ on:
         default: false
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: build-hermes-desktop-linux
@@ -127,10 +127,11 @@ jobs:
         env:
           HERMES_DESKTOP_VARIANT: ${{ matrix.variant_env }}
           TAG: ${{ needs.check.outputs.tag }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           VERSION="${TAG#v}"
           pnpm run build
-          pnpm run builder -- --linux AppImage --publish never -c.extraMetadata.version="${VERSION}"
+          node scripts/run-electron-builder.mjs --linux AppImage -c.extraMetadata.version="${VERSION}"
 
       - name: Stage and verify artifacts
         working-directory: hermes-agent/apps/desktop
@@ -247,6 +248,8 @@ jobs:
   release:
     needs: [check, build]
     if: needs.check.outputs.should_build == 'true'
+    permissions:
+      contents: write
     runs-on: ubuntu-latest
     steps:
       - name: Download all artifacts
