@@ -1,0 +1,210 @@
+name: Build Hermes Desktop ARM64
+
+on:
+  schedule:
+    # Check daily at 08:00 UTC for new upstream releases
+    - cron: '0 8 * * *'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Upstream NousResearch/hermes-agent tag (leave empty for latest stable release)'
+        required: false
+        default: ''
+      force:
+        description: 'Rebuild and overwrite release even if this tag already exists'
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-hermes-desktop-arm64
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+      should_build: ${{ steps.resolve.outputs.should_build }}
+    steps:
+      - name: Resolve upstream tag
+        id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_TAG: ${{ inputs.tag }}
+          INPUT_FORCE: ${{ inputs.force }}
+        run: |
+          if [ -n "$INPUT_TAG" ]; then
+            TAG="$INPUT_TAG"
+          else
+            TAG="$(gh api repos/NousResearch/hermes-agent/releases/latest --jq .tag_name)"
+          fi
+
+          if [ -z "$TAG" ] || [ "$TAG" = "null" ]; then
+            echo "Failed to resolve upstream tag" >&2
+            exit 1
+          fi
+
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+          if [ "$INPUT_FORCE" = "true" ]; then
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+          elif gh release view "$TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            echo "Release $TAG already exists; skipping build."
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Release $TAG not found; scheduling build."
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    needs: check
+    if: needs.check.outputs.should_build == 'true'
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - name: Checkout NousResearch/hermes-agent
+        uses: actions/checkout@v4
+        with:
+          repository: NousResearch/hermes-agent
+          ref: ${{ needs.check.outputs.tag }}
+          path: hermes-agent
+          fetch-depth: 1
+
+      - name: Setup Node.js 26
+        uses: actions/setup-node@v4
+        with:
+          node-version: '26'
+
+      - name: Install pinned pnpm
+        working-directory: hermes-agent
+        run: |
+          PNPM_VERSION="$(node -p "require('./pm/lock.json').packages.pnpm.version")"
+          echo "Installing pinned pnpm@${PNPM_VERSION}"
+          npm install -g "pnpm@${PNPM_VERSION}"
+          pnpm --version
+
+      - name: Install workspace dependencies
+        working-directory: hermes-agent
+        run: pnpm install --frozen-lockfile
+
+      - name: Build Hermes Light (unpacked linux-arm64)
+        working-directory: hermes-agent/apps/desktop
+        env:
+          HERMES_DESKTOP_VARIANT: light
+        run: pnpm run pack
+
+      - name: Stage and verify tarball
+        working-directory: hermes-agent/apps/desktop
+        run: |
+          set -euo pipefail
+
+          UNPACKED_DIR=""
+          for d in release/linux-arm64-unpacked release/linux-unpacked; do
+            if [ -d "$d" ]; then
+              UNPACKED_DIR="$d"
+              break
+            fi
+          done
+
+          if [ -z "$UNPACKED_DIR" ]; then
+            echo "Could not find unpacked Electron directory in release/:" >&2
+            ls -la release/ >&2
+            exit 1
+          fi
+
+          echo "Using unpacked directory: $UNPACKED_DIR"
+          ls -la "$UNPACKED_DIR"
+
+          EXEC_NAME=""
+          for candidate in "Hermes Light" "Hermes" "hermes-light" "hermes"; do
+            if [ -x "$UNPACKED_DIR/$candidate" ]; then
+              EXEC_NAME="$candidate"
+              break
+            fi
+          done
+
+          if [ -z "$EXEC_NAME" ]; then
+            echo "Could not locate Hermes executable in $UNPACKED_DIR" >&2
+            exit 1
+          fi
+
+          echo "Found executable: $EXEC_NAME"
+          file "$UNPACKED_DIR/$EXEC_NAME"
+          file "$UNPACKED_DIR/$EXEC_NAME" | grep -qiE 'aarch64|ARM aarch64'
+
+          STAGE="${RUNNER_TEMP}/stage/hermes-desktop"
+          rm -rf "$STAGE"
+          mkdir -p "$STAGE/bin" "$STAGE/share/icons"
+          cp -a "$UNPACKED_DIR" "$STAGE/app"
+          cp -a assets/icon.png "$STAGE/share/icons/hermes-desktop.png"
+
+          cat > "$STAGE/bin/hermes-desktop" <<'EOF'
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          SCRIPT_PATH="$(readlink -f "$0")"
+          ROOT_DIR="$(cd "$(dirname "$SCRIPT_PATH")/.." && pwd)"
+          APP_DIR="${ROOT_DIR}/app"
+
+          BIN=""
+          for candidate in "Hermes Light" "Hermes" "hermes-light" "hermes"; do
+            if [ -x "${APP_DIR}/${candidate}" ]; then
+              BIN="${APP_DIR}/${candidate}"
+              break
+            fi
+          done
+
+          if [ -z "$BIN" ]; then
+            echo "hermes-desktop: executable not found in ${APP_DIR}" >&2
+            exit 1
+          fi
+
+          EXTRA_FLAGS=(--ozone-platform-hint=auto)
+          if [ -n "${WAYLAND_DISPLAY:-}" ]; then
+            EXTRA_FLAGS+=(--enable-features=WaylandWindowDecorations)
+          fi
+
+          exec "$BIN" "${EXTRA_FLAGS[@]}" "$@"
+          EOF
+          chmod +x "$STAGE/bin/hermes-desktop"
+
+          # Verify node-pty loads cleanly under the bundled Electron runtime
+          NODE_PTY_ROOT="$STAGE/app/resources/app.asar.unpacked/dist/node_modules/node-pty"
+          if [ -f "$NODE_PTY_ROOT/package.json" ]; then
+            echo "Verifying node-pty native addon..."
+            ELECTRON_RUN_AS_NODE=1 NODE_PTY_ROOT="$NODE_PTY_ROOT" "$STAGE/app/$EXEC_NAME" -e \
+              'const pty = require(process.env.NODE_PTY_ROOT); if (typeof pty.spawn !== "function") process.exit(1); console.log("node-pty OK");'
+          fi
+
+          OUT_DIR="${RUNNER_TEMP}/dist"
+          mkdir -p "$OUT_DIR"
+          tar -C "${RUNNER_TEMP}/stage" -czf "$OUT_DIR/hermes-desktop-linux-arm64.tar.gz" hermes-desktop
+          (cd "$OUT_DIR" && sha256sum hermes-desktop-linux-arm64.tar.gz > SHA256SUMS)
+          ls -lh "$OUT_DIR"
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.check.outputs.tag }}
+        run: |
+          set -euo pipefail
+          OUT_DIR="${RUNNER_TEMP}/dist"
+          NOTES="Automated Linux ARM64 (aarch64) build of **Hermes Light** (remote-only client) from [NousResearch/hermes-agent@${TAG}](https://github.com/NousResearch/hermes-agent/releases/tag/${TAG})."
+
+          if gh release view "$TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            gh release upload "$TAG" \
+              "$OUT_DIR/hermes-desktop-linux-arm64.tar.gz" \
+              "$OUT_DIR/SHA256SUMS" \
+              --repo "${{ github.repository }}" \
+              --clobber
+          else
+            gh release create "$TAG" \
+              "$OUT_DIR/hermes-desktop-linux-arm64.tar.gz" \
+              "$OUT_DIR/SHA256SUMS" \
+              --repo "${{ github.repository }}" \
+              --title "Hermes Desktop ARM64 ${TAG}" \
+              --notes "$NOTES"
+          fi
