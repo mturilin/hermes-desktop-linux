@@ -30,10 +30,10 @@ Add to `~/.config/mise/config.toml` (auto-detects `x64` vs `arm64`):
 
 ```toml
 # Full Hermes Desktop (local + remote):
-"github:mturilin/hermes-desktop-linux" = { version = "latest", asset_pattern = "hermes-desktop-linux-*.tar.gz", minimum_release_age = "0s" }
+"github:mturilin/hermes-desktop-linux" = { version = "latest", matching = "desktop", minimum_release_age = "0s" }
 
 # Or Hermes Light (remote-only):
-"github:mturilin/hermes-desktop-linux" = { version = "latest", asset_pattern = "hermes-light-linux-*.tar.gz", minimum_release_age = "0s" }
+"github:mturilin/hermes-desktop-linux" = { version = "latest", matching = "light", minimum_release_age = "0s" }
 ```
 
 Then install and launch:
