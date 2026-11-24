@@ -90,6 +90,10 @@ jobs:
         working-directory: hermes-agent
         run: pnpm install --frozen-lockfile
 
+      - name: Prepare Electron runtime
+        working-directory: hermes-agent
+        run: node scripts/build/electron-runtime.mjs --source .
+
       - name: Build Hermes Light (unpacked linux-arm64)
         working-directory: hermes-agent/apps/desktop
         env:
